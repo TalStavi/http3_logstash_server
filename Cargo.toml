@@ -1,5 +1,5 @@
 [package]
-name = "http3_avro_json_logstash"
+name = "http3_logstash_server"
 version = "0.1.0"
 edition = "2021"
 

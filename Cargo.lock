@@ -283,7 +283,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
 
 [[package]]
-name = "http3_avro_json_logstash"
+name = "http3_logstash_server"
 version = "0.1.0"
 dependencies = [
  "bytes",
