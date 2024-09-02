@@ -1,18 +1,10 @@
-//! QUIC Server for Logstash
-//! 
-//! This module implements a QUIC server that receives JSON messages,
-//! processes them, and forwards them to a Logstash instance.
-//! 
-//! The server uses the quinn crate for QUIC protocol implementation and
-//! supports multi-threading for efficient request handling.
-
 use quinn::{Endpoint, ServerConfig};
-use rustls::{Certificate, PrivateKey};
 use rmp_serde::from_read;
+use rustls::pki_types::PrivatePkcs8KeyDer;
 use tokio::io::AsyncReadExt;
 use std::sync::Arc;
 use std::net::SocketAddr;
-use rcgen::generate_simple_self_signed;
+use rcgen::Certificate;
 use tokio::sync::{mpsc, Semaphore};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -37,9 +29,6 @@ const LOGSTASH_BUFFER_SIZE: usize = 64 * 1024;
 /// Threshold for flushing logstash buffer (32 KB)
 const LOGSTASH_FLUSH_THRESHOLD: usize = 32 * 1024;
 
-/// Acknowledgment message sent back to clients
-const ACK_MESSAGE: &[u8] = b"\x03ACK";
-
 /// Error types for the server
 #[derive(Error, Debug)]
 enum ServerError {
@@ -47,16 +36,12 @@ enum ServerError {
     Io(#[from] std::io::Error),
     #[error("Quinn connection error: {0}")]
     QuinnConnection(#[from] quinn::ConnectionError),
-    #[error("Quinn write error: {0}")]
-    QuinnWrite(#[from] quinn::WriteError),
     #[error("Quinn read error: {0}")]
     QuinnRead(#[from] quinn::ReadError),
     #[error("MessagePack error: {0}")]
     MessagePack(#[from] rmp_serde::decode::Error),
     #[error("TLS error: {0}")]
     Tls(#[from] rustls::Error),
-    #[error("Certificate generation error: {0}")]
-    CertGen(#[from] rcgen::RcgenError),
     #[error("Invalid message length")]
     InvalidMessageLength,
     #[error("Read exact error: {0}")]
@@ -94,6 +79,8 @@ struct Args {
     cert_path: String,
     #[clap(short, long)]
     debug: bool,
+    #[clap(long)]
+    no_writing: bool,
 }
 
 #[tokio::main]
@@ -113,32 +100,34 @@ async fn main() -> Result<(), ServerError> {
     let (sender, receiver) = bounded(100000);
     let logstash_writer = Arc::new(LogstashWriter::new(sender));
 
-    spawn_logstash_writer_task(receiver, &args.logstash_addr);
+    if !args.no_writing {
+        spawn_logstash_writer_task(receiver, &args.logstash_addr);
+    }
 
     let sem = Arc::new(Semaphore::new(args.max_connections));
 
-    run_server(endpoint, sem, logstash_writer, args.debug).await?;
+    run_server(endpoint, sem, logstash_writer, args.debug, args.no_writing).await?;
 
     Ok(())
 }
 
 /// Generates a self-signed certificate
-fn generate_certificate(cert_path: &str) -> Result<(Certificate, PrivateKey), ServerError> {
-    let subject_alt_names = vec!["localhost".to_string()];
-    let cert = generate_simple_self_signed(subject_alt_names)?;
-    let cert_der = cert.serialize_der()?;
-    let priv_key_der = cert.serialize_private_key_der();
+fn generate_certificate(cert_path: &str) -> Result<(Certificate, PrivatePkcs8KeyDer), ServerError> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let key = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+    let cert_der = cert.cert.der();
 
     let mut cert_file = File::create(cert_path)?;
     cert_file.write_all(&cert_der)?;
     info!("Certificate written to {}", cert_path);
 
-    Ok((Certificate(cert_der), PrivateKey(priv_key_der)))
+    Ok((cert.cert, key))
 }
 
-/// Creates the server configuration
-fn create_server_config(cert: Certificate, key: PrivateKey) -> Result<ServerConfig, ServerError> {
-    let mut server_config = ServerConfig::with_single_cert(vec![cert], key)?;
+fn create_server_config(cert: Certificate, key: PrivatePkcs8KeyDer) -> Result<ServerConfig, ServerError> {
+    let cert_der = rustls::pki_types::CertificateDer::from(cert);
+    let key_clone = key.clone_key();
+    let mut server_config = ServerConfig::with_single_cert(vec![cert_der], rustls::pki_types::PrivateKeyDer::Pkcs8(key_clone))?;
     let transport_config = Arc::new(quinn::TransportConfig::default());
     server_config.transport = transport_config;
     Ok(server_config)
@@ -195,18 +184,19 @@ async fn run_server(
     sem: Arc<Semaphore>,
     logstash_writer: Arc<LogstashWriter>,
     debug: bool,
+    no_writing: bool,
 ) -> Result<(), ServerError> {
-    let (request_tx, request_rx) = mpsc::channel::<(quinn::SendStream, quinn::RecvStream)>(10000);
+    let (request_tx, request_rx) = mpsc::channel::<quinn::RecvStream>(10000);
     let request_rx = Arc::new(Mutex::new(request_rx));
 
-    spawn_worker_tasks(Arc::clone(&request_rx), Arc::clone(&logstash_writer), debug);
+    spawn_worker_tasks(Arc::clone(&request_rx), Arc::clone(&logstash_writer), debug, no_writing);
 
     while let Some(conn) = endpoint.accept().await {
         let sem_clone = Arc::clone(&sem);
         let request_tx = request_tx.clone();
         task::spawn(async move {
             let _permit = sem_clone.acquire().await.unwrap();
-            if let Err(e) = handle_connection(conn, request_tx).await {
+            if let Err(e) = handle_connection(conn.await.unwrap(), request_tx).await {
                 error!("Connection error: {}", e);
             }
         });
@@ -216,27 +206,28 @@ async fn run_server(
 
 /// Spawns worker tasks for processing requests
 fn spawn_worker_tasks(
-    request_rx: Arc<Mutex<mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>>>,
+    request_rx: Arc<Mutex<mpsc::Receiver<quinn::RecvStream>>>,
     logstash_writer: Arc<LogstashWriter>,
     debug: bool,
+    no_writing: bool,
 ) {
     let num_workers = num_cpus::get();
     for _ in 0..num_workers {
         let request_rx = Arc::clone(&request_rx);
         let logstash_writer = Arc::clone(&logstash_writer);
-        let debug = debug;
         
         task::spawn(async move {
-            worker_task(request_rx, logstash_writer, debug).await;
+            worker_task(request_rx, logstash_writer, debug, no_writing).await;
         });
     }
 }
 
 /// Worker task for processing requests
 async fn worker_task(
-    request_rx: Arc<Mutex<mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>>>,
+    request_rx: Arc<Mutex<mpsc::Receiver<quinn::RecvStream>>>,
     logstash_writer: Arc<LogstashWriter>,
     debug: bool,
+    no_writing: bool,
 ) {
     let mut buf = BytesMut::with_capacity(65536);
     loop {
@@ -246,8 +237,8 @@ async fn worker_task(
         };
 
         match msg {
-            Ok((send, mut recv)) => {
-                if let Err(e) = process_request(&mut buf, send, &mut recv, &logstash_writer, debug).await {
+            Ok(mut recv) => {
+                if let Err(e) = process_request(&mut buf, &mut recv, &logstash_writer, debug, no_writing).await {
                     warn!("Error processing request: {}", e);
                 }
                 buf.clear();
@@ -263,12 +254,11 @@ async fn worker_task(
 
 /// Handles incoming connections
 async fn handle_connection(
-    conn: quinn::Connecting,
-    request_tx: mpsc::Sender<(quinn::SendStream, quinn::RecvStream)>,
+    connection: quinn::Connection,
+    request_tx: mpsc::Sender<quinn::RecvStream>,
 ) -> Result<(), ServerError> {
-    let connection = conn.await?;
-    while let Ok((send, recv)) = connection.accept_bi().await {
-        if request_tx.send((send, recv)).await.is_err() {
+    while let Ok(recv) = connection.accept_uni().await {
+        if request_tx.send(recv).await.is_err() {
             warn!("Failed to send request to worker");
         }
     }
@@ -278,10 +268,10 @@ async fn handle_connection(
 /// Processes a single request
 async fn process_request(
     buf: &mut BytesMut,
-    mut send: quinn::SendStream,
     recv: &mut quinn::RecvStream,
     writer: &LogstashWriter,
     debug: bool,
+    no_writing: bool,
 ) -> Result<(), ServerError> {
     buf.clear();
     read_length_prefixed_message(recv, buf).await?;
@@ -292,10 +282,10 @@ async fn process_request(
             println!("Received JSON: {}", json_value);
         }
         
-        writer.write_message(json_value.to_string())?;
+        if !no_writing {
+            writer.write_message(json_value.to_string())?;
+        }
     }
-
-    send_acknowledgment(&mut send).await?;
 
     Ok(())
 }
@@ -320,12 +310,5 @@ async fn read_length_prefixed_message(recv: &mut quinn::RecvStream, buf: &mut By
             )));
         }
     }
-    Ok(())
-}
-
-/// Sends an acknowledgment message back to the client
-async fn send_acknowledgment(send: &mut quinn::SendStream) -> Result<(), ServerError> {
-    send.write_all(ACK_MESSAGE).await?;
-    send.finish().await?;
     Ok(())
 }
